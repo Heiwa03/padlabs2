@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Message Broker with gRPC - Documentation</title>
+<style>
+  :root { --bg:#fff; --fg:#1c2330; --muted:#5b6678; --accent:#1f5fbf; --card:#f4f6fa; --border:#d8dee9; --code:#eef1f6; --ok:#1d7a46; --warn:#a15c00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121722; --fg:#e4e9f2; --muted:#9aa6bb; --accent:#6aa2ff; --card:#1a2132; --border:#2c3650; --code:#1f2840; --ok:#58c98b; --warn:#f0b24d; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:24px 16px 80px; }
+  nav { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 20px; margin:20px 0 32px; }
+  nav ol { margin:6px 0; padding-left:22px; columns:2; }
+  nav a { color:var(--accent); text-decoration:none; }
+  h1 { font-size:2rem; margin:16px 0 4px; }
+  h2 { margin-top:48px; padding-bottom:6px; border-bottom:2px solid var(--border); }
+  h3 { margin-top:28px; }
+  p.sub { color:var(--muted); margin-top:0; }
+  code { background:var(--code); padding:1px 5px; border-radius:4px; font:0.9em Consolas,monospace; }
+  pre { background:var(--code); padding:14px; border-radius:8px; overflow-x:auto; font:0.85em/1.5 Consolas,monospace; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--card); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 18px; margin:14px 0; }
+  .card.tip { border-left:5px solid var(--accent); }
+  .card.warn { border-left:5px solid var(--warn); }
+  .card.ok { border-left:5px solid var(--ok); }
+  details { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 16px; margin:10px 0; }
+  summary { cursor:pointer; font-weight:600; }
+  svg text { fill:var(--fg); font:13px system-ui,sans-serif; }
+  svg .box { fill:var(--card); stroke:var(--accent); stroke-width:1.5; }
+  svg .arrow { stroke:var(--fg); stroke-width:1.5; fill:none; }
+  svg .lbl { fill:var(--muted); font-size:12px; }
+  @media (max-width:640px) { nav ol { columns:1; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Message Broker over gRPC</h1>
+<p class="sub">Project 1, Part 2 &ndash; Messaging agent and remote invocation (RPC). Stack: C# (.NET 8) broker + Python clients.</p>
+
+<nav>
+<strong>Contents</strong>
+<ol>
+  <li><a href="#overview">What the project does</a></li>
+  <li><a href="#concepts">Concepts explained simply</a></li>
+  <li><a href="#architecture">Architecture</a></li>
+  <li><a href="#contract">The gRPC contract (.proto)</a></li>
+  <li><a href="#broker">The broker, class by class</a></li>
+  <li><a href="#clients">The Python clients</a></li>
+  <li><a href="#flow">Life of a message</a></li>
+  <li><a href="#requirements">Requirements checklist</a></li>
+  <li><a href="#choices">Design decisions and why</a></li>
+  <li><a href="#run">How to run it</a></li>
+  <li><a href="#tests">Tests and results</a></li>
+  <li><a href="#limits">Limitations (be honest)</a></li>
+  <li><a href="#qa">Questions the teacher may ask</a></li>
+</ol>
+</nav>
+
+<h2 id="overview">1. What the project does</h2>
+<p>It is a <strong>message broker</strong>: a middle program that receives messages from <em>senders</em> and delivers them to <em>receivers</em>, so the two sides never talk to each other directly. A sender only says <em>"publish this message on topic <code>orders</code>"</em>; any receiver that is subscribed to <code>orders</code> gets it.</p>
+<p><strong>Part 1</strong> of the assignment built this with raw TCP sockets, where you must invent your own message format and read/write bytes yourself. <strong>Part 2</strong> (this project) keeps the same architecture but replaces sockets with <strong>RPC</strong> (gRPC): instead of sending bytes, programs call functions like <code>Publish(...)</code> that run on another machine. The data format is defined in a <code>.proto</code> file (Protocol Buffers).</p>
+
+<div class="card tip"><strong>One-sentence summary for the teacher:</strong> "A C# gRPC broker that routes JSON messages by topic from Python senders to Python receivers, validates input, handles requests concurrently, stores messages durably on disk, and guarantees at-least-once delivery with acknowledgements, retries and a dead-letter topic."</div>
+
+<h2 id="concepts">2. Concepts explained simply</h2>
+
+<h3>2.1 Message broker (agent de mesagerie)</h3>
+<p>Think of a <strong>post office</strong>. You do not walk to your friend's house; you drop a letter at the post office with an address (the topic) and the post office delivers it. Benefits:</p>
+<ul>
+  <li><strong>Decoupling</strong>: the sender does not know who receives, how many receivers there are, or whether they are online right now.</li>
+  <li><strong>Asynchronous communication</strong>: the sender hands over the message and continues; the receiver processes it later, at its own speed.</li>
+  <li><strong>Flexibility</strong>: you can add a new receiver without touching the sender.</li>
+</ul>
+<p>Costs (from the assignment): the broker is a <em>single point of failure</em>, adds an extra hop (latency), and must be maintained.</p>
+
+<h3>2.2 Publisher / Subscriber and topics</h3>
+<p>A <strong>topic</strong> is a named channel (like a radio frequency or a YouTube channel). <strong>Publishers</strong> send to a topic; <strong>subscribers</strong> listen to topics they care about. Every subscriber of a topic gets its own copy (this is called <em>fan-out</em>). Subscribers of other topics get nothing. The alternative, explicit queues, requires the sender to know a queue name; topics hide the routing behind a logical name.</p>
+
+<h3>2.3 Sockets vs RPC</h3>
+<table>
+<tr><th></th><th>Sockets (Part 1)</th><th>RPC / gRPC (Part 2)</th></tr>
+<tr><td>You write</td><td>Connection handling, message framing (where does a message end?), parsing, error codes</td><td>Just call a function; the library does networking and serialization</td></tr>
+<tr><td>Contract</td><td>Written in documentation, enforced by your code</td><td>Written in a <code>.proto</code> file, enforced by generated code</td></tr>
+<tr><td>Typing</td><td>Text (JSON) you must validate</td><td>Strongly typed fields; wrong types are rejected automatically</td></tr>
+<tr><td>Abstraction level</td><td>Low</td><td>Higher: you focus on logic, not bytes</td></tr>
+</table>
+<p><strong>RPC = Remote Procedure Call</strong>: calling a function that physically runs in another process or machine as if it were local. The client holds a <em>stub</em> (a fake local object); calling <code>stub.Publish(...)</code> serializes the arguments, sends them over the network, the server runs the real method, and the result comes back.</p>
+
+<h3>2.4 gRPC</h3>
+<p>An open-source RPC framework from Google. It uses <strong>HTTP/2</strong> as transport (one TCP connection carries many parallel calls, binary framing, built-in streaming) and <strong>Protocol Buffers</strong> as the data format. It supports four call types:</p>
+<table>
+<tr><th>Type</th><th>Meaning</th><th>Used here</th></tr>
+<tr><td>Unary</td><td>1 request &rarr; 1 response</td><td><code>Publish</code>, <code>Ack</code></td></tr>
+<tr><td>Server streaming</td><td>1 request &rarr; many responses over time</td><td><code>Subscribe</code> (the broker <em>pushes</em> messages)</td></tr>
+<tr><td>Client streaming</td><td>many requests &rarr; 1 response</td><td>not used</td></tr>
+<tr><td>Bidirectional streaming</td><td>both sides stream</td><td>not used</td></tr>
+</table>
+
+<h3>2.5 Protocol Buffers (protobuf)</h3>
+<p>A schema language plus a compact <strong>binary</strong> serialization. You describe messages in <code>broker.proto</code>; the compiler (<code>protoc</code>) generates classes for C# and Python from the same file, so both languages agree on the structure. Each field has a number (<code>string topic = 1;</code>) &mdash; the number, not the name, goes on the wire, which makes messages small and lets you evolve the schema without breaking old clients. Compared to JSON it is smaller and faster to parse, and the schema is mandatory (JSON is self-describing but unchecked).</p>
+<p>Others you may be asked about: <strong>Apache Thrift</strong> (similar idea, own RPC + format), <strong>Avro</strong> (schema stored with the data, popular in Kafka/Hadoop), <strong>GraphQL</strong> (query language where the client chooses fields; typically over HTTP/JSON, not a message-broker tool).</p>
+
+<h3>2.6 Serialization</h3>
+<p>Turning an in-memory object into bytes/text for sending (and back = deserialization). Here two layers exist: the <strong>sender</strong> serializes its business data to a <strong>JSON string</strong> (the payload), and gRPC/protobuf serializes the whole request (topic + payload + ...) into binary. The broker does not change the payload &mdash; it only checks that it parses as JSON.</p>
+
+<h3>2.7 Concurrency, threads, thread-safe collections</h3>
+<p><strong>Concurrency</strong> means handling several things at once so that one slow request does not block others. With sockets you would do <em>thread-per-request</em> manually. Here, ASP.NET's server (Kestrel) automatically runs each incoming gRPC call on a thread-pool thread, and <code>async/await</code> frees the thread while waiting for I/O. A <strong>race condition</strong> happens when two threads modify shared data at once and corrupt it; <strong>thread-safe collections</strong> (<code>ConcurrentDictionary</code>, <code>Channel&lt;T&gt;</code>) are built to be used from many threads without explicit locks. Where a lock is needed (writing the file) I use <code>SemaphoreSlim</code>.</p>
+
+<h3>2.8 Background worker / cron job</h3>
+<p>A loop that wakes up on a timer and does work independent of any request. Here <code>DispatchWorker</code> wakes every 200 ms, looks at stored messages and pushes them to subscribers. This separates <em>receiving</em> (fast, in the request) from <em>delivering</em> (done by the worker), which is what the assignment calls "work jobs".</p>
+
+<h3>2.9 Transient vs persistent storage</h3>
+<ul>
+  <li><strong>Transient</strong>: only in memory. Fast but lost if the broker stops.</li>
+  <li><strong>Persistent</strong>: also written to disk. Survives a crash.</li>
+</ul>
+<p>This project does both: memory (<code>ConcurrentDictionary</code>) for speed, mirrored to <code>store.jsonl</code> on disk for durability.</p>
+
+<h3>2.10 Delivery guarantees</h3>
+<table>
+<tr><th>Guarantee</th><th>Meaning</th><th>Problem</th></tr>
+<tr><td>At-most-once</td><td>send once, never retry</td><td>may lose messages</td></tr>
+<tr><td><strong>At-least-once</strong> (ours)</td><td>retry until acknowledged</td><td>may deliver duplicates</td></tr>
+<tr><td>Exactly-once</td><td>once and only once</td><td>very hard in distributed systems</td></tr>
+</table>
+<p><strong>ACK (acknowledgement)</strong>: the receiver says "I processed message X". If no ACK comes within <code>AckTimeoutMs</code>, the broker resends. After <code>MaxAttempts</code> failures the message is moved to the <strong>dead-letter queue</strong> (<code>$dlq</code> topic) so it does not retry forever and a human/another program can inspect it. Because duplicates are possible, receivers should be <strong>idempotent</strong> (processing the same message twice has no extra effect).</p>
+
+<h3>2.11 Deduplication and idempotency</h3>
+<p>A sender may retry a publish after a network error and accidentally send twice. If it gives the message an <code>id</code>, the broker recognizes a repeated <code>id</code> and answers <code>duplicate=true</code> without storing it again.</p>
+
+<h3>2.12 Why TCP / HTTP/2 (and not UDP)</h3>
+<p>TCP is reliable (retransmits lost packets, keeps order, detects broken connections). UDP is faster but may lose, duplicate or reorder packets. A broker must not lose messages, so TCP is the right choice. gRPC runs on HTTP/2 which runs on TCP, so this is automatic.</p>
+
+<h2 id="architecture">3. Architecture</h2>
+<svg viewBox="0 0 900 300" width="100%" role="img" aria-label="Architecture diagram">
+  <defs><marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="currentColor"/></marker></defs>
+  <g color="#888">
+  <rect class="box" x="20" y="100" width="150" height="80" rx="8"/><text x="95" y="135" text-anchor="middle">Sender</text><text x="95" y="155" text-anchor="middle" class="lbl">sender.py (Python)</text>
+  <rect class="box" x="320" y="30" width="270" height="240" rx="8"/><text x="455" y="55" text-anchor="middle" font-weight="bold">Broker (C# / .NET 8)</text>
+  <rect class="box" x="340" y="70" width="230" height="40" rx="6"/><text x="455" y="95" text-anchor="middle">BrokerService (gRPC endpoints)</text>
+  <rect class="box" x="340" y="125" width="230" height="40" rx="6"/><text x="455" y="150" text-anchor="middle">MessageStore (memory + file)</text>
+  <rect class="box" x="340" y="180" width="230" height="35" rx="6"/><text x="455" y="203" text-anchor="middle">DispatchWorker (periodic job)</text>
+  <rect class="box" x="340" y="225" width="230" height="35" rx="6"/><text x="455" y="248" text-anchor="middle">TopicRegistry (topic &#8594; subscribers)</text>
+  <rect class="box" x="740" y="40" width="140" height="70" rx="8"/><text x="810" y="70" text-anchor="middle">Receiver 1</text><text x="810" y="90" text-anchor="middle" class="lbl">receiver.py</text>
+  <rect class="box" x="740" y="190" width="140" height="70" rx="8"/><text x="810" y="220" text-anchor="middle">Receiver 2</text><text x="810" y="240" text-anchor="middle" class="lbl">receiver.py</text>
+  <line class="arrow" x1="170" y1="140" x2="318" y2="140" marker-end="url(#ah)"/>
+  <text x="244" y="130" text-anchor="middle" class="lbl">Publish (unary)</text>
+  <line class="arrow" x1="590" y1="90" x2="738" y2="75" marker-end="url(#ah)"/>
+  <line class="arrow" x1="590" y1="210" x2="738" y2="225" marker-end="url(#ah)"/>
+  <text x="665" y="60" text-anchor="middle" class="lbl">Subscribe (stream)</text>
+  <text x="665" y="255" text-anchor="middle" class="lbl">Ack (unary) goes back</text>
+  </g>
+</svg>
+<p>Three kinds of process: <strong>sender</strong> (producer), <strong>broker</strong> (middle) and <strong>receivers</strong> (consumers). Communication is logically unidirectional: sender &rarr; broker (<code>Publish</code>) and broker &rarr; receiver (stream opened by <code>Subscribe</code>). The only reverse traffic is the small <code>Ack</code> call.</p>
+
+<h3>Folder layout</h3>
+<pre>part2/
+  protos/broker.proto        the shared contract (C# and Python are generated from it)
+  Broker/
+    Program.cs               starts the web host, registers services
+    Core.cs                  MessageStore, TopicRegistry, DispatchWorker, BrokerService
+    appsettings.json         port 5000 (HTTP/2), timeouts, limits
+    Broker.csproj            project; compiles the .proto automatically
+  clients/
+    sender.py, receiver.py   the two Python programs
+    broker_pb2*.py           GENERATED stubs (do not edit)
+    test_e2e.py              end-to-end tests that start the real broker
+  README.md  DOCUMENTATION.html</pre>
+
+<h2 id="contract">4. The gRPC contract (<code>broker.proto</code>)</h2>
+<pre><code>service MessageBroker {
+  rpc Publish   (PublishRequest)   returns (PublishReply);        // sender -> broker
+  rpc Subscribe (SubscribeRequest) returns (stream Message);      // broker -> receiver (push)
+  rpc Ack       (AckRequest)       returns (PublishReply);        // receiver -> broker
+}</code></pre>
+<table>
+<tr><th>Message</th><th>Fields</th><th>Purpose</th></tr>
+<tr><td><code>PublishRequest</code></td><td>topic, payload (JSON string), sender, id (optional)</td><td>what the sender submits</td></tr>
+<tr><td><code>PublishReply</code></td><td>ok, error, message_id, duplicate</td><td>"accepted" or "rejected because&hellip;"</td></tr>
+<tr><td><code>SubscribeRequest</code></td><td>topic, subscriber (logical name)</td><td>"send me everything for this topic"</td></tr>
+<tr><td><code>Message</code></td><td>id, topic, payload, sender, timestamp_ms</td><td>one delivered message</td></tr>
+<tr><td><code>AckRequest</code></td><td>subscriber, message_id</td><td>"I processed this one"</td></tr>
+</table>
+<p>Data representation required by the assignment: <strong>proto</strong>. The business payload inside is JSON (kept as a string so the broker can forward it unchanged &mdash; the assignment says the message must not be altered in transit).</p>
+
+<h2 id="broker">5. The broker, class by class (<code>Broker/Core.cs</code>)</h2>
+
+<h3>MessageStore &ndash; storage</h3>
+<ul>
+  <li>Holds all <em>pending</em> (not yet fully acknowledged) messages in a <code>ConcurrentDictionary&lt;id, Message&gt;</code> &rarr; thread-safe, transient part.</li>
+  <li>On every add/remove it rewrites <code>store.jsonl</code> (one JSON object per line) &rarr; persistent part. It writes to a <code>.tmp</code> file and then renames, so a crash in the middle never leaves a half-written file (the rename is atomic). A <code>SemaphoreSlim</code> lock allows only one writer at a time.</li>
+  <li>The constructor reloads the file at startup &rarr; <strong>crash recovery</strong>. Corrupt lines are skipped with a warning.</li>
+</ul>
+
+<h3>TopicRegistry &ndash; routing</h3>
+<ul>
+  <li>Maps <code>topic &rarr; { subscriberName &rarr; Subscriber }</code>.</li>
+  <li>Each <code>Subscriber</code> owns a <code>Channel&lt;Message&gt;</code>: a thread-safe queue where the worker writes and the gRPC stream reads. It also tracks per-message delivery state (attempts, last send time, acked, dead).</li>
+  <li>If a subscriber with the same name reconnects, the old one is replaced (its channel closed).</li>
+</ul>
+
+<h3>DispatchWorker &ndash; the periodic job</h3>
+<p>Every <code>DispatchIntervalMs</code> (200 ms) it loops over pending messages and, for each current subscriber of the message's topic:</p>
+<ol>
+  <li>skip if already acked or dead;</li>
+  <li>skip if sent recently and the ACK timeout has not expired;</li>
+  <li>if attempts &ge; <code>MaxAttempts</code> &rarr; mark dead and copy the message to topic <code>$dlq</code>;</li>
+  <li>otherwise increment attempts, record the time, and write the message into the subscriber's channel.</li>
+</ol>
+<p>When every subscriber has acked (or is dead) the message is deleted from the store. If there are no subscribers, nothing happens and the message waits &rarr; this is the <strong>backlog</strong> behaviour. The tick is wrapped in try/catch so an error never kills the worker.</p>
+
+<h3>BrokerService &ndash; the gRPC endpoints</h3>
+<table>
+<tr><th>Method</th><th>What it does</th></tr>
+<tr><td><code>Publish</code></td><td>Validates (see below), assigns an id (or uses the client's), checks duplicates, stores the message, replies <code>ok=true</code>. It does <em>not</em> deliver &mdash; it only stores, which keeps it fast.</td></tr>
+<tr><td><code>Subscribe</code></td><td>Registers the subscriber, then loops <code>await foreach</code> over its channel writing each message to the gRPC stream. The call stays open until the client disconnects (cancellation token), then it unregisters in <code>finally</code>.</td></tr>
+<tr><td><code>Ack</code></td><td>Marks the message as acked for that subscriber; the worker then cleans it up.</td></tr>
+</table>
+
+<h3>Validation rules (in <code>Publish</code>)</h3>
+<ul>
+  <li>topic required; only letters, digits, <code>. - _</code>; max 100 chars (so <code>$dlq</code> is reserved &mdash; nobody can publish into it);</li>
+  <li>payload required, &le; <code>MaxPayloadBytes</code> (64 KB), and must be <strong>valid JSON</strong> (checked with <code>JsonDocument.Parse</code>);</li>
+  <li>id &le; 128 chars.</li>
+</ul>
+<p>Invalid input returns <code>ok=false</code> with an error text; the exception is caught, logged and the broker keeps running. That answers the assignment's "handle exceptions for invalid messages so the broker does not crash".</p>
+
+<h2 id="clients">6. The Python clients</h2>
+<h3>sender.py</h3>
+<p>Builds JSON with <code>json.dumps</code> (<em>the sender serializes</em>), opens a channel to <code>localhost:5000</code>, calls <code>stub.Publish(...)</code> with a 5-second deadline and prints <code>OK id=&hellip;</code> or <code>REJECTED: reason</code>. If the broker is down, it catches <code>grpc.RpcError</code> and prints "broker unavailable". <code>--raw</code> sends an arbitrary string to demonstrate rejection.</p>
+<h3>receiver.py</h3>
+<p>Calls <code>stub.Subscribe(...)</code> which returns an iterator; <code>for msg in ...</code> blocks and yields messages as the broker pushes them. Each message is handed to a <code>ThreadPoolExecutor</code> (8 workers) so a slow message does not block the stream (<strong>concurrent processing</strong>). The handler parses the JSON, prints it and sends <code>Ack</code>. A <code>while True</code> loop reconnects after 2 s if the broker disappears.</p>
+
+<h2 id="flow">7. Life of a message</h2>
+<ol>
+  <li><strong>Sender</strong> serializes <code>{"seq":1,...}</code> to a JSON string and calls <code>Publish(topic="orders", payload=...)</code>.</li>
+  <li><strong>gRPC/protobuf</strong> turns the request into binary and sends it over HTTP/2.</li>
+  <li><strong>Broker.Publish</strong> validates, creates a <code>Message</code> with a GUID id, saves it to memory and to <code>store.jsonl</code>, replies <code>ok</code>. The sender is now free.</li>
+  <li><strong>DispatchWorker</strong> (&le;200 ms later) sees the message, finds subscribers of <code>orders</code>, writes it to each one's channel (attempt 1).</li>
+  <li><strong>Subscribe stream</strong> of each receiver pulls from the channel and sends it down the open connection.</li>
+  <li><strong>Receiver</strong> processes it and calls <code>Ack</code>.</li>
+  <li>When all subscribers acked, the worker deletes the message from memory and disk.</li>
+</ol>
+<div class="card warn"><strong>Failure paths.</strong> No ACK &rarr; resend every 3 s, max 3 attempts, then copy to <code>$dlq</code>. No subscriber &rarr; message stays stored. Broker crash &rarr; unacked messages reload from <code>store.jsonl</code>. Receiver crash &rarr; its stream ends; on reconnect it gets a fresh state and pending messages are re-sent.</div>
+
+<h2 id="requirements">8. Requirements checklist (from the assignment)</h2>
+<table>
+<tr><th>Requirement</th><th>Where / how</th></tr>
+<tr><td>Use an RPC instead of sockets</td><td>gRPC (<code>Grpc.AspNetCore</code> in C#, <code>grpcio</code> in Python)</td></tr>
+<tr><td>Data representation proto</td><td><code>protos/broker.proto</code></td></tr>
+<tr><td>Message format JSON; sender serializes</td><td>payload is a JSON string made by <code>json.dumps</code> in the sender</td></tr>
+<tr><td>Message not altered in transit</td><td>broker forwards <code>payload</code> byte-for-byte (test 02 uses odd whitespace)</td></tr>
+<tr><td>Number of channels / one-to-one structure</td><td>one Publish path + one stream per subscription; topic selects the channel</td></tr>
+<tr><td>Delivery policies (invalid messages, broker down)</td><td>validation + reject; ACK/retry/DLQ; disk recovery; sender and receiver handle "broker unavailable"</td></tr>
+<tr><td>Concurrent processing</td><td>Kestrel runs each call in parallel; worker job; receiver thread pool; tested with 8 parallel senders</td></tr>
+<tr><td>Transient storage with thread-safe collections</td><td><code>ConcurrentDictionary</code>, <code>Channel&lt;T&gt;</code></td></tr>
+<tr><td>Persistent storage</td><td><code>store.jsonl</code> with atomic rewrite</td></tr>
+<tr><td>Publisher/Subscriber with topics</td><td><code>TopicRegistry</code>, <code>Subscribe</code></td></tr>
+<tr><td>Data validation</td><td>topic, size, JSON validity, id length</td></tr>
+<tr><td>Sender &rarr; broker &rarr; receiver</td><td>the minimum grade is exceeded: subscription, storage and concurrency are all implemented</td></tr>
+</table>
+
+<h2 id="choices">9. Design decisions and why</h2>
+<table>
+<tr><th>Decision</th><th>Reason</th></tr>
+<tr><td>gRPC (not Thrift)</td><td>very widely used, great .NET + Python support, built-in streaming (perfect for push delivery), HTTP/2.</td></tr>
+<tr><td>C# for the broker, Python for clients</td><td>Mixed stack allowed; C# has excellent concurrent collections and background services; Python is quick for small clients; the shared <code>.proto</code> shows that languages are interchangeable behind the contract.</td></tr>
+<tr><td>Server streaming for Subscribe</td><td>Push instead of polling: receivers do not hammer the broker asking "anything new?" &mdash; the assignment's "message pooling puts pressure on the broker" problem.</td></tr>
+<tr><td>Topics instead of explicit queues</td><td>The sender stays unaware of receivers; routing is transparent.</td></tr>
+<tr><td>Payload as JSON string inside protobuf</td><td>keeps the message unaltered, and lets different topics carry different shapes without changing the schema.</td></tr>
+<tr><td>Publish only stores; worker delivers</td><td>fast acknowledgement to the sender, and the delivery logic (retry, backoff, DLQ) lives in one place.</td></tr>
+<tr><td>At-least-once</td><td>Never lose a message after <code>ok</code>; duplicates are manageable with ids.</td></tr>
+<tr><td>JSON-lines file with atomic rename</td><td>Simple, human-readable, crash-safe, no database required.</td></tr>
+</table>
+
+<h2 id="run">10. How to run it locally</h2>
+<p>Requirements: .NET 8 SDK and Python 3 with <code>pip install grpcio grpcio-tools</code>. Three terminals:</p>
+<pre><code># terminal 1 - broker (listens on http://localhost:5000)
+cd part2/Broker
+dotnet run
+
+# terminal 2 - receiver subscribed to topic "orders" with name "r1"
+cd part2/clients
+python receiver.py orders r1
+
+# terminal 3 - send 3 messages
+cd part2/clients
+python sender.py orders 3
+python sender.py orders --raw "not json"     # rejected by validation</code></pre>
+<p>Demo ideas for the teacher: (a) start the sender <em>before</em> the receiver &mdash; messages are waiting and arrive when the receiver connects; (b) start two receivers with different names &mdash; both get each message; (c) stop the broker (Ctrl+C) with messages unacked, restart, and see them delivered; (d) check <code>Broker/store.jsonl</code> while messages are pending.</p>
+<p>Regenerate the Python stubs after changing the proto (from <code>part2</code>):</p>
+<pre><code>python -m grpc_tools.protoc -Iprotos --python_out=clients --grpc_python_out=clients protos/broker.proto</code></pre>
+<p>Settings are in <code>Broker/appsettings.json</code>: <code>AckTimeoutMs</code> (3000), <code>MaxAttempts</code> (3), <code>DispatchIntervalMs</code> (200), <code>MaxPayloadBytes</code> (65536), <code>StorePath</code>.</p>
+
+<h2 id="tests">11. Tests and results</h2>
+<p><code>clients/test_e2e.py</code> starts the real broker as a process and talks to it with real gRPC (timeouts shortened to 0.6 s for speed). Command: <code>cd part2/clients &amp;&amp; python test_e2e.py</code>. Result of the last run: <strong>10 tests, all OK, 14 s</strong>.</p>
+<table>
+<tr><th>#</th><th>Test</th><th>What it proves</th></tr>
+<tr><td>01</td><td>valid message delivered</td><td>basic pub/sub path works</td></tr>
+<tr><td>02</td><td>payload not altered</td><td>odd-whitespace JSON arrives identical</td></tr>
+<tr><td>03</td><td>invalid messages rejected</td><td>empty/bad topic, empty payload, non-JSON, 70 KB payload, reserved <code>$dlq</code> are all rejected and the broker still accepts a valid message afterwards</td></tr>
+<tr><td>04</td><td>backlog</td><td>messages published with no subscriber are delivered to a late subscriber</td></tr>
+<tr><td>05</td><td>fan-out</td><td>two subscribers of one topic both receive the message</td></tr>
+<tr><td>06</td><td>topic isolation</td><td>a subscriber of another topic receives nothing</td></tr>
+<tr><td>07</td><td>deduplication</td><td>same <code>id</code> twice &rarr; second reply has <code>duplicate=true</code></td></tr>
+<tr><td>08</td><td>dead-letter</td><td>a subscriber that never acks gets exactly 3 deliveries, then the message appears on <code>$dlq</code></td></tr>
+<tr><td>09</td><td>concurrent publishers</td><td>8 threads &times; 50 messages = 400 messages, all 400 received, all ids unique</td></tr>
+<tr><td>zz</td><td>crash recovery</td><td>message found in <code>store.jsonl</code>; after killing and restarting the broker, a new subscriber still receives it</td></tr>
+</table>
+
+<h2 id="limits">12. Limitations (say them before the teacher finds them)</h2>
+<ul>
+  <li><strong>Single broker</strong>: single point of failure; no replication/standby (the assignment lists the mitigation but does not require it).</li>
+  <li><strong>No consumer groups</strong>: every subscriber gets every message (fan-out). Load-balancing among several workers of one logical service is not implemented.</li>
+  <li><strong>Whole-file rewrite</strong> on each change: simple and safe but O(n); a real broker would append to a log (write-ahead log) and compact periodically.</li>
+  <li><strong>Deduplication only while a message is pending</strong>: once it is fully acked and deleted, its id is forgotten.</li>
+  <li><strong>At-least-once, not exactly-once</strong>: duplicates are possible after timeouts/reconnects; receivers should be idempotent.</li>
+  <li><strong>No security</strong>: plain HTTP/2 without TLS, no authentication; fine for a local lab, not for production.</li>
+  <li>The per-subscriber delivery state is in memory: after a broker restart the attempt counters start again (the messages themselves are not lost).</li>
+  <li>A message that lands in <code>$dlq</code> with nobody subscribed to <code>$dlq</code> stays in storage.</li>
+</ul>
+
+<h2 id="qa">13. Questions the teacher may ask</h2>
+
+<details open><summary>What is the difference between Part 1 and Part 2?</summary>
+<p>Architecture is identical (sender &rarr; broker &rarr; receiver, topics, storage, concurrency). In Part 1 I implemented the communication myself on sockets: framing, parsing, threads. In Part 2 gRPC provides connection handling, serialization and typed contracts, so the code deals only with broker logic.</p></details>
+
+<details><summary>Why gRPC and not REST?</summary>
+<p>gRPC has a strict typed contract, binary encoding (smaller/faster), HTTP/2 multiplexing and native streaming. Streaming matters here: the broker can push messages instead of receivers polling. REST has no natural server-push.</p></details>
+
+<details><summary>Why protobuf and not JSON?</summary>
+<p>Smaller on the wire, faster to parse, schema-enforced, code generation for any language. JSON is easier to read and debug. I use both: protobuf for the envelope, JSON for the business payload so it stays opaque and unchanged.</p></details>
+
+<details><summary>Why TCP and not UDP?</summary>
+<p>A broker must not lose or reorder messages. TCP guarantees delivery and order; UDP does not. gRPC needs HTTP/2, which needs TCP anyway.</p></details>
+
+<details><summary>How do you handle concurrency?</summary>
+<p>The server processes each gRPC call on its own thread-pool task (async, non-blocking I/O). Shared state uses thread-safe types: <code>ConcurrentDictionary</code>, <code>Channel</code>; file writes are serialized with a semaphore. A background worker delivers messages, and the receiver processes messages in a thread pool. Test 09 sends 400 messages from 8 threads and all arrive.</p></details>
+
+<details><summary>What happens if the broker crashes?</summary>
+<p>Every accepted message is on disk (<code>store.jsonl</code>) before the sender gets <code>ok</code>. On restart the store reloads it and the worker delivers it as soon as there is a subscriber (test "zz"). Clients catch the connection error; the receiver reconnects automatically every 2 s.</p></details>
+
+<details><summary>What happens if a receiver crashes or is slow?</summary>
+<p>No ACK arrives, so after 3 s the broker resends; after 3 attempts the message goes to <code>$dlq</code>. If the receiver disconnects and returns, it re-subscribes and unfinished messages are redelivered.</p></details>
+
+<details><summary>Can a message be lost? Can it be duplicated?</summary>
+<p>Not lost after the broker said <code>ok</code> (it is on disk until acked). It can be duplicated (at-least-once): e.g. receiver processed it but crashed before the ACK. Hence idempotent receivers and ids.</p></details>
+
+<details><summary>How does the broker know where to send a message?</summary>
+<p>By topic. The sender gives only a topic name; the <code>TopicRegistry</code> knows which subscribers registered for it through <code>Subscribe</code>.</p></details>
+
+<details><summary>How does the stream (Subscribe) work?</summary>
+<p>The receiver makes one call and the server never "finishes" it: the server keeps the response stream open and writes a new <code>Message</code> whenever the subscriber's channel has one. The call ends when the client cancels or disconnects; the <code>finally</code> block then unregisters the subscriber.</p></details>
+
+<details><summary>What is a Channel&lt;T&gt; and why use it?</summary>
+<p>A thread-safe producer/consumer queue from .NET. The worker (producer) writes, the stream handler (consumer) awaits reads without blocking a thread. It avoids manual locks and busy waiting.</p></details>
+
+<details><summary>What is a dead-letter queue?</summary>
+<p>A special place for messages that could not be delivered after the maximum attempts. Without it, a "poison" message would be retried forever. Here it is the reserved topic <code>$dlq</code>; anyone can subscribe to inspect failures.</p></details>
+
+<details><summary>How does validation work and why is it needed?</summary>
+<p>The broker is a shared service: one bad message must not crash it or poison receivers. It checks topic characters, payload size, JSON syntax and id length, and replies with a clear error. gRPC itself already rejects wrong field types because of the typed contract.</p></details>
+
+<details><summary>Why does Publish not deliver directly?</summary>
+<p>Separation of concerns and speed: Publish only validates and persists, so senders are not slowed by receivers. The worker handles retries and timing for all messages uniformly.</p></details>
+
+<details><summary>What would you improve with more time?</summary>
+<p>Consumer groups for load balancing, a write-ahead log instead of rewriting the file, a standby broker with replication, TLS and authentication, persistent dedup ids, and metrics (queue length, delivery latency).</p></details>
+
+<details><summary>What is the "single point of failure" and how would you fix it?</summary>
+<p>If the broker stops, nothing flows. Fix: run a second broker and replicate state to it (primary/standby), with clients failing over. Not implemented here; my disk persistence at least prevents data loss.</p></details>
+
+<details><summary>Explain the code path of one publish in 20 seconds.</summary>
+<p>"Sender calls <code>Publish</code> through the generated stub &rarr; protobuf over HTTP/2 &rarr; <code>BrokerService.Publish</code> validates, stores in memory and file, returns ok &rarr; the worker pushes the message into each subscriber's channel &rarr; the <code>Subscribe</code> stream sends it to the receiver &rarr; the receiver calls <code>Ack</code> &rarr; the message is deleted."</p></details>
+
+</div>
+</body>
+</html>

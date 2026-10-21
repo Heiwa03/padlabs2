@@ -1,0 +1,20 @@
+# .NET
+bin/
+obj/
+*.user
+.vs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime data
+store.jsonl
+store.jsonl.tmp
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db

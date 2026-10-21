@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+option csharp_namespace = "Broker.Grpc";
+package broker;
+
+service MessageBroker {
+  // Sender -> broker. Payload is a JSON document serialized by the sender.
+  rpc Publish (PublishRequest) returns (PublishReply);
+  // Receiver -> broker. Server-streaming: the broker pushes messages for the topic.
+  rpc Subscribe (SubscribeRequest) returns (stream Message);
+  // Receiver confirms processing, so the broker can drop the message from storage.
+  rpc Ack (AckRequest) returns (PublishReply);
+}
+
+message PublishRequest {
+  string topic = 1;
+  string payload = 2;   // JSON, forwarded unchanged
+  string sender = 3;
+  string id = 4;        // optional, client-chosen; repeated id is deduplicated
+}
+
+message PublishReply {
+  bool ok = 1;
+  string error = 2;
+  string message_id = 3;
+  bool duplicate = 4;
+}
+
+message SubscribeRequest {
+  string topic = 1;
+  string subscriber = 2;  // logical receiver name
+}
+
+message Message {
+  string id = 1;
+  string topic = 2;
+  string payload = 3;
+  string sender = 4;
+  int64 timestamp_ms = 5;
+}
+
+message AckRequest {
+  string subscriber = 1;
+  string message_id = 2;
+}
