@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.*" />
-    <Protobuf Include="..\protos\broker.proto" GrpcServices="Server" />
+    <Protobuf Include="..\protos\broker.proto" GrpcServices="Server" ProtoRoot="..\protos" />
+    <Protobuf Include="..\protos\events.proto" GrpcServices="None" ProtoRoot="..\protos" />
   </ItemGroup>
 </Project>

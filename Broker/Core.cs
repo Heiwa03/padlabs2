@@ -1,5 +1,5 @@
 using System.Collections.Concurrent;
-using System.Text.Json;
+using Google.Protobuf;
 using System.Threading.Channels;
 using Broker.Grpc;
 using Grpc.Core;
@@ -7,14 +7,13 @@ using Grpc.Core;
 namespace Broker;
 
 /// Persistent store: every pending (unacknowledged) message is kept in a thread-safe
-/// dictionary and mirrored to a JSON-lines file, so it survives a broker crash.
+/// dictionary and mirrored to a file (one base64-encoded protobuf Message per line),
+/// so it survives a broker crash.
 public class MessageStore
 {
     private readonly ConcurrentDictionary<string, Message> _pending = new();
     private readonly SemaphoreSlim _fileLock = new(1, 1);
     private readonly string _path;
-
-    private record Dto(string Id, string Topic, string Payload, string Sender, long Ts);
 
     public MessageStore(IConfiguration cfg, ILogger<MessageStore> log)
     {
@@ -24,11 +23,13 @@ public class MessageStore
         {
             try
             {
-                var m = JsonSerializer.Deserialize<Dto>(line);
-                if (m != null)
-                    _pending[m.Id] = new Message { Id = m.Id, Topic = m.Topic, Payload = m.Payload, Sender = m.Sender, TimestampMs = m.Ts };
+                var m = Message.Parser.ParseFrom(Convert.FromBase64String(line));
+                _pending[m.Id] = m;
             }
-            catch (JsonException) { log.LogWarning("Skipping corrupt store line"); }
+            catch (Exception e) when (e is FormatException or InvalidProtocolBufferException)
+            {
+                log.LogWarning("Skipping corrupt store line");
+            }
         }
         log.LogInformation("Recovered {n} pending messages from {p}", _pending.Count, _path);
     }
@@ -53,8 +54,7 @@ public class MessageStore
         await _fileLock.WaitAsync();
         try
         {
-            var lines = _pending.Values.Select(m =>
-                JsonSerializer.Serialize(new Dto(m.Id, m.Topic, m.Payload, m.Sender, m.TimestampMs)));
+            var lines = _pending.Values.Select(m => Convert.ToBase64String(m.ToByteArray()));
             var tmp = _path + ".tmp";
             await File.WriteAllLinesAsync(tmp, lines);
             File.Move(tmp, _path, true);
@@ -170,12 +170,9 @@ public class BrokerService(MessageStore store, TopicRegistry registry, IConfigur
             return Fail("topic is required");
         if (req.Topic.Length > 100 || req.Topic.Any(c => !(char.IsLetterOrDigit(c) || c is '.' or '-' or '_')))
             return Fail("topic may contain only letters, digits, '.', '-', '_' (max 100)");
-        if (string.IsNullOrWhiteSpace(req.Payload))
-            return Fail("payload is required");
-        if (System.Text.Encoding.UTF8.GetByteCount(req.Payload) > maxBytes)
-            return Fail($"payload exceeds {maxBytes} bytes");
-        try { using var _ = JsonDocument.Parse(req.Payload); }
-        catch (JsonException e) { return Fail("payload is not valid JSON: " + e.Message); }
+        var payloadError = PayloadValidator.Validate(req.Payload, maxBytes);
+        if (payloadError != null)
+            return Fail(payloadError);
 
         var id = string.IsNullOrWhiteSpace(req.Id) ? Guid.NewGuid().ToString("N") : req.Id;
         if (id.Length > 128) return Fail("id too long (max 128)");
@@ -186,7 +183,7 @@ public class BrokerService(MessageStore store, TopicRegistry registry, IConfigur
         {
             Id = id,
             Topic = req.Topic,
-            Payload = req.Payload,   // forwarded unaltered
+            Payload = req.Payload,   // Any forwarded as received (type URL + bytes)
             Sender = req.Sender,
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         };
