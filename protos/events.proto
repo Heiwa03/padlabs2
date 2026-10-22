@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+option csharp_namespace = "Broker.Events";
+package events;
+
+// Domain messages carried by the broker. Senders and receivers share this schema;
+// the broker only needs it to validate the contents (it routes by topic, not by type).
+
+message OrderCreated {
+  int64 order_id = 1;     // must be > 0
+  string customer = 2;    // required
+  double total = 3;       // must be >= 0
+}
+
+message Notification {
+  enum Severity {
+    SEVERITY_UNSPECIFIED = 0;
+    INFO = 1;
+    WARNING = 2;
+    ERROR = 3;
+  }
+  string title = 1;       // required
+  string body = 2;
+  Severity severity = 3;  // must not be UNSPECIFIED
+}
