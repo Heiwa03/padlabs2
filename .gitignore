@@ -18,3 +18,4 @@ store.jsonl.tmp
 .idea/
 .vscode/
 Thumbs.db
+events_pb2_grpc.py
