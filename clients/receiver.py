@@ -2,7 +2,6 @@
 
 Usage: python receiver.py <topic> <name>
 """
-import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,16 +10,33 @@ import grpc
 
 import broker_pb2
 import broker_pb2_grpc
+import events_pb2
 
 ADDR = "localhost:5000"
 
+# type URL -> generated class; the receiver shares the schema with the sender
+TYPES = {
+    "events.OrderCreated": events_pb2.OrderCreated,
+    "events.Notification": events_pb2.Notification,
+}
+
+
+def decode(any_msg):
+    cls = TYPES.get(any_msg.type_url.rsplit("/", 1)[-1])
+    if cls is None or not any_msg.Is(cls.DESCRIPTOR):
+        return None
+    obj = cls()
+    any_msg.Unpack(obj)
+    return obj
+
 
 def handle(stub, name, msg):
-    try:
-        data = json.loads(msg.payload)
-        print(f"[{name}] {msg.topic} <- {msg.sender}: {data}", flush=True)
-    except json.JSONDecodeError:
-        print(f"[{name}] invalid JSON dropped: {msg.id}", flush=True)
+    obj = decode(msg.payload)
+    if obj is None:
+        print(f"[{name}] unknown payload type {msg.payload.type_url}, skipped", flush=True)
+    else:
+        fields = ", ".join(f"{f.name}={v}" for f, v in obj.ListFields())
+        print(f"[{name}] {msg.topic} <- {msg.sender}: {type(obj).__name__}({fields})", flush=True)
     stub.Ack(broker_pb2.AckRequest(subscriber=name, message_id=msg.id))
 
 
