@@ -67,7 +67,7 @@
 <p>It is a <strong>message broker</strong>: a middle program that receives messages from <em>senders</em> and delivers them to <em>receivers</em>, so the two sides never talk to each other directly. A sender only says <em>"publish this message on topic <code>orders</code>"</em>; any receiver that is subscribed to <code>orders</code> gets it.</p>
 <p><strong>Part 1</strong> of the assignment built this with raw TCP sockets, where you must invent your own message format and read/write bytes yourself. <strong>Part 2</strong> (this project) keeps the same architecture but replaces sockets with <strong>RPC</strong> (gRPC): instead of sending bytes, programs call functions like <code>Publish(...)</code> that run on another machine. The data format is defined in a <code>.proto</code> file (Protocol Buffers).</p>
 
-<div class="card tip"><strong>One-sentence summary for the teacher:</strong> "A C# gRPC broker that routes JSON messages by topic from Python senders to Python receivers, validates input, handles requests concurrently, stores messages durably on disk, and guarantees at-least-once delivery with acknowledgements, retries and a dead-letter topic."</div>
+<div class="card tip"><strong>One-sentence summary for the teacher:</strong> "A C# gRPC broker that routes typed protobuf messages by topic from Python senders to Python receivers, validates input, handles requests concurrently, stores messages durably on disk, and guarantees at-least-once delivery with acknowledgements, retries and a dead-letter topic."</div>
 
 <h2 id="concepts">2. Concepts explained simply</h2>
 
@@ -88,7 +88,7 @@
 <tr><th></th><th>Sockets (Part 1)</th><th>RPC / gRPC (Part 2)</th></tr>
 <tr><td>You write</td><td>Connection handling, message framing (where does a message end?), parsing, error codes</td><td>Just call a function; the library does networking and serialization</td></tr>
 <tr><td>Contract</td><td>Written in documentation, enforced by your code</td><td>Written in a <code>.proto</code> file, enforced by generated code</td></tr>
-<tr><td>Typing</td><td>Text (JSON) you must validate</td><td>Strongly typed fields; wrong types are rejected automatically</td></tr>
+<tr><td>Typing</td><td>Text (JSON) you must parse and validate yourself</td><td>Strongly typed fields; wrong types are rejected automatically</td></tr>
 <tr><td>Abstraction level</td><td>Low</td><td>Higher: you focus on logic, not bytes</td></tr>
 </table>
 <p><strong>RPC = Remote Procedure Call</strong>: calling a function that physically runs in another process or machine as if it were local. The client holds a <em>stub</em> (a fake local object); calling <code>stub.Publish(...)</code> serializes the arguments, sends them over the network, the server runs the real method, and the result comes back.</p>
@@ -105,10 +105,12 @@
 
 <h3>2.5 Protocol Buffers (protobuf)</h3>
 <p>A schema language plus a compact <strong>binary</strong> serialization. You describe messages in <code>broker.proto</code>; the compiler (<code>protoc</code>) generates classes for C# and Python from the same file, so both languages agree on the structure. Each field has a number (<code>string topic = 1;</code>) &mdash; the number, not the name, goes on the wire, which makes messages small and lets you evolve the schema without breaking old clients. Compared to JSON it is smaller and faster to parse, and the schema is mandatory (JSON is self-describing but unchecked).</p>
+<h3>2.5b <code>google.protobuf.Any</code> and typed payloads</h3>
+<p>A broker should not need to know every kind of message that will ever flow through it. <code>Any</code> is a protobuf "envelope inside the envelope": it holds <strong>(a)</strong> a type URL such as <code>type.googleapis.com/events.OrderCreated</code> and <strong>(b)</strong> the already-serialized bytes of <em>any</em> protobuf message. The sender calls <code>any.Pack(order)</code>; the receiver checks <code>any.Is(OrderCreated)</code> and calls <code>any.Unpack(...)</code> to get a real typed object back. So the data is genuinely protobuf (typed, binary, schema-checked), while the broker's own schema stays small and fixed. The real domain types are in <code>events.proto</code>.</p>
 <p>Others you may be asked about: <strong>Apache Thrift</strong> (similar idea, own RPC + format), <strong>Avro</strong> (schema stored with the data, popular in Kafka/Hadoop), <strong>GraphQL</strong> (query language where the client chooses fields; typically over HTTP/JSON, not a message-broker tool).</p>
 
 <h3>2.6 Serialization</h3>
-<p>Turning an in-memory object into bytes/text for sending (and back = deserialization). Here two layers exist: the <strong>sender</strong> serializes its business data to a <strong>JSON string</strong> (the payload), and gRPC/protobuf serializes the whole request (topic + payload + ...) into binary. The broker does not change the payload &mdash; it only checks that it parses as JSON.</p>
+<p>Turning an in-memory object into bytes/text for sending (and back = deserialization). Here two layers exist: the <strong>sender</strong> serializes its business object (e.g. <code>OrderCreated</code>) to protobuf bytes and packs it into an <code>Any</code> (the payload), and gRPC serializes the whole request (topic + payload + &hellip;) into binary on the wire. The broker never rewrites the payload; it validates it and forwards the same type URL and bytes.</p>
 
 <h3>2.7 Concurrency, threads, thread-safe collections</h3>
 <p><strong>Concurrency</strong> means handling several things at once so that one slow request does not block others. With sockets you would do <em>thread-per-request</em> manually. Here, ASP.NET's server (Kestrel) automatically runs each incoming gRPC call on a thread-pool thread, and <code>async/await</code> frees the thread while waiting for I/O. A <strong>race condition</strong> happens when two threads modify shared data at once and corrupt it; <strong>thread-safe collections</strong> (<code>ConcurrentDictionary</code>, <code>Channel&lt;T&gt;</code>) are built to be used from many threads without explicit locks. Where a lock is needed (writing the file) I use <code>SemaphoreSlim</code>.</p>
@@ -121,7 +123,7 @@
   <li><strong>Transient</strong>: only in memory. Fast but lost if the broker stops.</li>
   <li><strong>Persistent</strong>: also written to disk. Survives a crash.</li>
 </ul>
-<p>This project does both: memory (<code>ConcurrentDictionary</code>) for speed, mirrored to <code>store.jsonl</code> on disk for durability.</p>
+<p>This project does both: memory (<code>ConcurrentDictionary</code>) for speed, mirrored to <code>store.jsonl</code> on disk (one base64-encoded protobuf <code>Message</code> per line) for durability.</p>
 
 <h3>2.10 Delivery guarantees</h3>
 <table>
@@ -162,10 +164,12 @@
 
 <h3>Folder layout</h3>
 <pre>part2/
-  protos/broker.proto        the shared contract (C# and Python are generated from it)
+  protos/broker.proto        the broker service contract (Publish / Subscribe / Ack)
+  protos/events.proto        the domain messages (OrderCreated, Notification); C# and Python are generated from both
   Broker/
     Program.cs               starts the web host, registers services
     Core.cs                  MessageStore, TopicRegistry, DispatchWorker, BrokerService
+    PayloadValidator.cs      unpacks the Any and validates the typed contents
     appsettings.json         port 5000 (HTTP/2), timeouts, limits
     Broker.csproj            project; compiles the .proto automatically
   clients/
@@ -182,20 +186,33 @@
 }</code></pre>
 <table>
 <tr><th>Message</th><th>Fields</th><th>Purpose</th></tr>
-<tr><td><code>PublishRequest</code></td><td>topic, payload (JSON string), sender, id (optional)</td><td>what the sender submits</td></tr>
+<tr><td><code>PublishRequest</code></td><td>topic, payload (<code>google.protobuf.Any</code>), sender, id (optional)</td><td>what the sender submits</td></tr>
 <tr><td><code>PublishReply</code></td><td>ok, error, message_id, duplicate</td><td>"accepted" or "rejected because&hellip;"</td></tr>
 <tr><td><code>SubscribeRequest</code></td><td>topic, subscriber (logical name)</td><td>"send me everything for this topic"</td></tr>
 <tr><td><code>Message</code></td><td>id, topic, payload, sender, timestamp_ms</td><td>one delivered message</td></tr>
 <tr><td><code>AckRequest</code></td><td>subscriber, message_id</td><td>"I processed this one"</td></tr>
 </table>
-<p>Data representation required by the assignment: <strong>proto</strong>. The business payload inside is JSON (kept as a string so the broker can forward it unchanged &mdash; the assignment says the message must not be altered in transit).</p>
+<p>Data representation required by the assignment: <strong>proto</strong>, end to end. The business data is a typed protobuf message, carried in an <code>Any</code> so the broker forwards it unchanged (the assignment says the message must not be altered in transit).</p>
+<h3>The domain schema (<code>events.proto</code>)</h3>
+<pre><code>message OrderCreated { int64 order_id = 1; string customer = 2; double total = 3; }
+message Notification {
+  enum Severity { SEVERITY_UNSPECIFIED = 0; INFO = 1; WARNING = 2; ERROR = 3; }
+  string title = 1; string body = 2; Severity severity = 3;
+}</code></pre>
+<p>Both sides compile this file. A new message type = add it to <code>events.proto</code>, regenerate the stubs, and add a rule to <code>PayloadValidator</code>.</p>
+<div class="card tip"><strong>Why <code>Any</code> and not a <code>oneof</code> or a generic JSON string?</strong>
+<ul>
+<li><em>JSON string</em> (my first version): works, but the schema does not describe the data, I had to hand-validate syntax, and it defeats the point of using protobuf.</li>
+<li><em><code>oneof</code> of concrete types</em>: strongest typing, but the broker's own contract must list every message type and change whenever one is added.</li>
+<li><em><code>Any</code></em> (chosen): typed and binary like the others, while <code>broker.proto</code> never changes when new event types are added. The price: the broker only knows the types it has compiled in, so it rejects anything else.</li>
+</ul></div>
 
 <h2 id="broker">5. The broker, class by class (<code>Broker/Core.cs</code>)</h2>
 
 <h3>MessageStore &ndash; storage</h3>
 <ul>
   <li>Holds all <em>pending</em> (not yet fully acknowledged) messages in a <code>ConcurrentDictionary&lt;id, Message&gt;</code> &rarr; thread-safe, transient part.</li>
-  <li>On every add/remove it rewrites <code>store.jsonl</code> (one JSON object per line) &rarr; persistent part. It writes to a <code>.tmp</code> file and then renames, so a crash in the middle never leaves a half-written file (the rename is atomic). A <code>SemaphoreSlim</code> lock allows only one writer at a time.</li>
+  <li>On every add/remove it rewrites <code>store.jsonl</code> &rarr; persistent part. Each line is one protobuf <code>Message</code> serialized to bytes and base64-encoded (the file stays line-based text but holds exactly what the contract defines). It writes to a <code>.tmp</code> file and then renames, so a crash in the middle never leaves a half-written file (the rename is atomic); the rename is retried briefly because Windows can lock the target for a moment. A <code>SemaphoreSlim</code> lock allows only one writer at a time, and <strong>group commit</strong> lets writers queued behind it share one flush: a caller returns only after a flush that includes its change, but ten concurrent publishes do not cause ten file rewrites.</li>
   <li>The constructor reloads the file at startup &rarr; <strong>crash recovery</strong>. Corrupt lines are skipped with a warning.</li>
 </ul>
 
@@ -227,20 +244,20 @@
 <h3>Validation rules (in <code>Publish</code>)</h3>
 <ul>
   <li>topic required; only letters, digits, <code>. - _</code>; max 100 chars (so <code>$dlq</code> is reserved &mdash; nobody can publish into it);</li>
-  <li>payload required, &le; <code>MaxPayloadBytes</code> (64 KB), and must be <strong>valid JSON</strong> (checked with <code>JsonDocument.Parse</code>);</li>
+  <li>payload required, &le; <code>MaxPayloadBytes</code> (64 KB), with a <strong>known type URL</strong>; the <code>Any</code> is then unpacked with the generated class (<code>PayloadValidator</code>), which fails on corrupt bytes, and field rules are checked: <code>OrderCreated.order_id &gt; 0</code>, customer required, <code>total &ge; 0</code>; <code>Notification.title</code> required, severity not <code>UNSPECIFIED</code>;</li>
   <li>id &le; 128 chars.</li>
 </ul>
 <p>Invalid input returns <code>ok=false</code> with an error text; the exception is caught, logged and the broker keeps running. That answers the assignment's "handle exceptions for invalid messages so the broker does not crash".</p>
 
 <h2 id="clients">6. The Python clients</h2>
 <h3>sender.py</h3>
-<p>Builds JSON with <code>json.dumps</code> (<em>the sender serializes</em>), opens a channel to <code>localhost:5000</code>, calls <code>stub.Publish(...)</code> with a 5-second deadline and prints <code>OK id=&hellip;</code> or <code>REJECTED: reason</code>. If the broker is down, it catches <code>grpc.RpcError</code> and prints "broker unavailable". <code>--raw</code> sends an arbitrary string to demonstrate rejection.</p>
+<p>Builds a typed message (<code>events_pb2.OrderCreated</code> or <code>Notification</code>), packs it into an <code>Any</code> (<em>the sender serializes</em>), opens a channel to <code>localhost:5000</code>, calls <code>stub.Publish(...)</code> with a 5-second deadline and prints <code>OK id=&hellip;</code> or <code>REJECTED: reason</code>. If the broker is down, it catches <code>grpc.RpcError</code> and prints "broker unavailable". <code>--type notification</code> picks the other message type and <code>--invalid</code> sends a message that breaks the field rules (e.g. <code>order_id = 0</code>) to demonstrate rejection.</p>
 <h3>receiver.py</h3>
-<p>Calls <code>stub.Subscribe(...)</code> which returns an iterator; <code>for msg in ...</code> blocks and yields messages as the broker pushes them. Each message is handed to a <code>ThreadPoolExecutor</code> (8 workers) so a slow message does not block the stream (<strong>concurrent processing</strong>). The handler parses the JSON, prints it and sends <code>Ack</code>. A <code>while True</code> loop reconnects after 2 s if the broker disappears.</p>
+<p>Calls <code>stub.Subscribe(...)</code> which returns an iterator; <code>for msg in ...</code> blocks and yields messages as the broker pushes them. Each message is handed to a <code>ThreadPoolExecutor</code> (8 workers) so a slow message does not block the stream (<strong>concurrent processing</strong>). The handler looks up the generated class from the Any type URL, unpacks it into a real typed object, prints its fields and sends <code>Ack</code>; an unknown type is skipped (but still acked so it is not retried forever). A <code>while True</code> loop reconnects after 2 s if the broker disappears.</p>
 
 <h2 id="flow">7. Life of a message</h2>
 <ol>
-  <li><strong>Sender</strong> serializes <code>{"seq":1,...}</code> to a JSON string and calls <code>Publish(topic="orders", payload=...)</code>.</li>
+  <li><strong>Sender</strong> builds <code>OrderCreated(order_id=1, ...)</code>, packs it into an <code>Any</code> and calls <code>Publish(topic="orders", payload=...)</code>.</li>
   <li><strong>gRPC/protobuf</strong> turns the request into binary and sends it over HTTP/2.</li>
   <li><strong>Broker.Publish</strong> validates, creates a <code>Message</code> with a GUID id, saves it to memory and to <code>store.jsonl</code>, replies <code>ok</code>. The sender is now free.</li>
   <li><strong>DispatchWorker</strong> (&le;200 ms later) sees the message, finds subscribers of <code>orders</code>, writes it to each one's channel (attempt 1).</li>
@@ -255,15 +272,15 @@
 <tr><th>Requirement</th><th>Where / how</th></tr>
 <tr><td>Use an RPC instead of sockets</td><td>gRPC (<code>Grpc.AspNetCore</code> in C#, <code>grpcio</code> in Python)</td></tr>
 <tr><td>Data representation proto</td><td><code>protos/broker.proto</code></td></tr>
-<tr><td>Message format JSON; sender serializes</td><td>payload is a JSON string made by <code>json.dumps</code> in the sender</td></tr>
+<tr><td>Message format (Part 1 allows XML/JSON; Part 2 asks for proto)</td><td>typed protobuf messages in an <code>Any</code>, serialized by the sender (<code>Any.Pack</code>)</td></tr>
 <tr><td>Message not altered in transit</td><td>broker forwards <code>payload</code> byte-for-byte (test 02 uses odd whitespace)</td></tr>
 <tr><td>Number of channels / one-to-one structure</td><td>one Publish path + one stream per subscription; topic selects the channel</td></tr>
 <tr><td>Delivery policies (invalid messages, broker down)</td><td>validation + reject; ACK/retry/DLQ; disk recovery; sender and receiver handle "broker unavailable"</td></tr>
 <tr><td>Concurrent processing</td><td>Kestrel runs each call in parallel; worker job; receiver thread pool; tested with 8 parallel senders</td></tr>
 <tr><td>Transient storage with thread-safe collections</td><td><code>ConcurrentDictionary</code>, <code>Channel&lt;T&gt;</code></td></tr>
-<tr><td>Persistent storage</td><td><code>store.jsonl</code> with atomic rewrite</td></tr>
+<tr><td>Persistent storage</td><td><code>store.jsonl</code> (base64 protobuf per line) with atomic rewrite and group commit</td></tr>
 <tr><td>Publisher/Subscriber with topics</td><td><code>TopicRegistry</code>, <code>Subscribe</code></td></tr>
-<tr><td>Data validation</td><td>topic, size, JSON validity, id length</td></tr>
+<tr><td>Data validation</td><td>topic, size, known type, decodable bytes, field rules, id length</td></tr>
 <tr><td>Sender &rarr; broker &rarr; receiver</td><td>the minimum grade is exceeded: subscription, storage and concurrency are all implemented</td></tr>
 </table>
 
@@ -274,10 +291,10 @@
 <tr><td>C# for the broker, Python for clients</td><td>Mixed stack allowed; C# has excellent concurrent collections and background services; Python is quick for small clients; the shared <code>.proto</code> shows that languages are interchangeable behind the contract.</td></tr>
 <tr><td>Server streaming for Subscribe</td><td>Push instead of polling: receivers do not hammer the broker asking "anything new?" &mdash; the assignment's "message pooling puts pressure on the broker" problem.</td></tr>
 <tr><td>Topics instead of explicit queues</td><td>The sender stays unaware of receivers; routing is transparent.</td></tr>
-<tr><td>Payload as JSON string inside protobuf</td><td>keeps the message unaltered, and lets different topics carry different shapes without changing the schema.</td></tr>
+<tr><td>Typed payload in <code>Any</code></td><td>real protobuf data with schema validation, while the broker contract stays fixed and the bytes are forwarded unaltered. See the comparison in section 4.</td></tr>
 <tr><td>Publish only stores; worker delivers</td><td>fast acknowledgement to the sender, and the delivery logic (retry, backoff, DLQ) lives in one place.</td></tr>
 <tr><td>At-least-once</td><td>Never lose a message after <code>ok</code>; duplicates are manageable with ids.</td></tr>
-<tr><td>JSON-lines file with atomic rename</td><td>Simple, human-readable, crash-safe, no database required.</td></tr>
+<tr><td>Line-based file with atomic rename</td><td>Simple, crash-safe, no database required; base64 lines keep the exact protobuf bytes.</td></tr>
 </table>
 
 <h2 id="run">10. How to run it locally</h2>
@@ -293,33 +310,36 @@ python receiver.py orders r1
 # terminal 3 - send 3 messages
 cd part2/clients
 python sender.py orders 3
-python sender.py orders --raw "not json"     # rejected by validation</code></pre>
+python sender.py alerts 1 --type notification
+python sender.py orders 1 --invalid          # order_id = 0 -> rejected by validation</code></pre>
 <p>Demo ideas for the teacher: (a) start the sender <em>before</em> the receiver &mdash; messages are waiting and arrive when the receiver connects; (b) start two receivers with different names &mdash; both get each message; (c) stop the broker (Ctrl+C) with messages unacked, restart, and see them delivered; (d) check <code>Broker/store.jsonl</code> while messages are pending.</p>
-<p>Regenerate the Python stubs after changing the proto (from <code>part2</code>):</p>
-<pre><code>python -m grpc_tools.protoc -Iprotos --python_out=clients --grpc_python_out=clients protos/broker.proto</code></pre>
+<p>Regenerate the Python stubs after changing a proto (from <code>part2</code>; the C# side regenerates on build):</p>
+<pre><code>python -m grpc_tools.protoc -Iprotos --python_out=clients --grpc_python_out=clients protos/broker.proto protos/events.proto</code></pre>
+<p>(<code>events_pb2_grpc.py</code> is generated empty because <code>events.proto</code> defines no service; delete it, it is not needed and not committed.)</p>
 <p>Settings are in <code>Broker/appsettings.json</code>: <code>AckTimeoutMs</code> (3000), <code>MaxAttempts</code> (3), <code>DispatchIntervalMs</code> (200), <code>MaxPayloadBytes</code> (65536), <code>StorePath</code>.</p>
 
 <h2 id="tests">11. Tests and results</h2>
-<p><code>clients/test_e2e.py</code> starts the real broker as a process and talks to it with real gRPC (timeouts shortened to 0.6 s for speed). Command: <code>cd part2/clients &amp;&amp; python test_e2e.py</code>. Result of the last run: <strong>10 tests, all OK, 14 s</strong>.</p>
+<p><code>clients/test_e2e.py</code> starts the real broker as a process and talks to it with real gRPC (timeouts shortened to 0.6 s for speed). Command: <code>cd part2/clients &amp;&amp; python test_e2e.py</code>. Result of the last run: <strong>10 tests, all OK, about 19 s (3 consecutive runs)</strong>.</p>
 <table>
 <tr><th>#</th><th>Test</th><th>What it proves</th></tr>
 <tr><td>01</td><td>valid message delivered</td><td>basic pub/sub path works</td></tr>
-<tr><td>02</td><td>payload not altered</td><td>odd-whitespace JSON arrives identical</td></tr>
-<tr><td>03</td><td>invalid messages rejected</td><td>empty/bad topic, empty payload, non-JSON, 70 KB payload, reserved <code>$dlq</code> are all rejected and the broker still accepts a valid message afterwards</td></tr>
+<tr><td>02</td><td>payload not altered</td><td>the received <code>Any</code> has the same type URL and the same bytes as the one sent</td></tr>
+<tr><td>03</td><td>invalid messages rejected</td><td>empty/bad topic, missing payload, unknown type, corrupt bytes, <code>order_id = 0</code>, unspecified severity, 70 KB payload, reserved <code>$dlq</code> are all rejected and the broker still accepts a valid message afterwards</td></tr>
 <tr><td>04</td><td>backlog</td><td>messages published with no subscriber are delivered to a late subscriber</td></tr>
 <tr><td>05</td><td>fan-out</td><td>two subscribers of one topic both receive the message</td></tr>
 <tr><td>06</td><td>topic isolation</td><td>a subscriber of another topic receives nothing</td></tr>
 <tr><td>07</td><td>deduplication</td><td>same <code>id</code> twice &rarr; second reply has <code>duplicate=true</code></td></tr>
 <tr><td>08</td><td>dead-letter</td><td>a subscriber that never acks gets exactly 3 deliveries, then the message appears on <code>$dlq</code></td></tr>
 <tr><td>09</td><td>concurrent publishers</td><td>8 threads &times; 50 messages = 400 messages, all 400 received, all ids unique</td></tr>
-<tr><td>zz</td><td>crash recovery</td><td>message found in <code>store.jsonl</code>; after killing and restarting the broker, a new subscriber still receives it</td></tr>
+<tr><td>zz</td><td>crash recovery</td><td>after killing and restarting the broker, a new subscriber still receives the stored typed message (decoded back to <code>order_id = 42</code>)</td></tr>
 </table>
 
 <h2 id="limits">12. Limitations (say them before the teacher finds them)</h2>
 <ul>
   <li><strong>Single broker</strong>: single point of failure; no replication/standby (the assignment lists the mitigation but does not require it).</li>
   <li><strong>No consumer groups</strong>: every subscriber gets every message (fan-out). Load-balancing among several workers of one logical service is not implemented.</li>
-  <li><strong>Whole-file rewrite</strong> on each change: simple and safe but O(n); a real broker would append to a log (write-ahead log) and compact periodically.</li>
+  <li><strong>Whole-file rewrite</strong> on each flush: simple and safe but O(n) (group commit reduces how often); a real broker would append to a log (write-ahead log) and compact periodically.</li>
+  <li><strong>The broker only accepts message types compiled into it</strong> (<code>PayloadValidator</code>); a new type means editing <code>events.proto</code>, the validator and rebuilding.</li>
   <li><strong>Deduplication only while a message is pending</strong>: once it is fully acked and deleted, its id is forgotten.</li>
   <li><strong>At-least-once, not exactly-once</strong>: duplicates are possible after timeouts/reconnects; receivers should be idempotent.</li>
   <li><strong>No security</strong>: plain HTTP/2 without TLS, no authentication; fine for a local lab, not for production.</li>
@@ -332,11 +352,17 @@ python sender.py orders --raw "not json"     # rejected by validation</code></pr
 <details open><summary>What is the difference between Part 1 and Part 2?</summary>
 <p>Architecture is identical (sender &rarr; broker &rarr; receiver, topics, storage, concurrency). In Part 1 I implemented the communication myself on sockets: framing, parsing, threads. In Part 2 gRPC provides connection handling, serialization and typed contracts, so the code deals only with broker logic.</p></details>
 
+<details><summary>What is <code>Any</code> and why do you use it?</summary>
+<p>It is a protobuf wrapper holding a type URL plus serialized bytes of any message. It lets the broker carry different typed messages (orders, notifications) without its own contract changing. The sender packs, the broker validates by unpacking with the known type, and the receiver unpacks to a typed object. The bytes are forwarded unchanged.</p></details>
+
+<details><summary>Why did you change from JSON payloads to typed messages?</summary>
+<p>The JSON string worked but was not the gRPC way: the schema did not describe the data and I validated syntax by hand. With typed messages the contract documents the data, the generated classes enforce structure in both languages, and validation is about meaning (field rules), not parsing.</p></details>
+
 <details><summary>Why gRPC and not REST?</summary>
 <p>gRPC has a strict typed contract, binary encoding (smaller/faster), HTTP/2 multiplexing and native streaming. Streaming matters here: the broker can push messages instead of receivers polling. REST has no natural server-push.</p></details>
 
 <details><summary>Why protobuf and not JSON?</summary>
-<p>Smaller on the wire, faster to parse, schema-enforced, code generation for any language. JSON is easier to read and debug. I use both: protobuf for the envelope, JSON for the business payload so it stays opaque and unchanged.</p></details>
+<p>Smaller on the wire, faster to parse, schema-enforced, code generation for any language. JSON is easier to read and debug but nothing checks its structure. The first version of this project carried JSON text inside the protobuf envelope; I changed it so the payload is a typed protobuf message too (inside <code>Any</code>).</p></details>
 
 <details><summary>Why TCP and not UDP?</summary>
 <p>A broker must not lose or reorder messages. TCP guarantees delivery and order; UDP does not. gRPC needs HTTP/2, which needs TCP anyway.</p></details>
@@ -366,7 +392,7 @@ python sender.py orders --raw "not json"     # rejected by validation</code></pr
 <p>A special place for messages that could not be delivered after the maximum attempts. Without it, a "poison" message would be retried forever. Here it is the reserved topic <code>$dlq</code>; anyone can subscribe to inspect failures.</p></details>
 
 <details><summary>How does validation work and why is it needed?</summary>
-<p>The broker is a shared service: one bad message must not crash it or poison receivers. It checks topic characters, payload size, JSON syntax and id length, and replies with a clear error. gRPC itself already rejects wrong field types because of the typed contract.</p></details>
+<p>The broker is a shared service: one bad message must not crash it or poison receivers. It checks topic characters, payload size, that the type is known, that the bytes decode as that type, the field rules and the id length, and replies with a clear error. Wrong wire types are already rejected by protobuf parsing; the field rules (e.g. <code>order_id &gt; 0</code>) are business validation on top.</p></details>
 
 <details><summary>Why does Publish not deliver directly?</summary>
 <p>Separation of concerns and speed: Publish only validates and persists, so senders are not slowed by receivers. The worker handles retries and timing for all messages uniformly.</p></details>
