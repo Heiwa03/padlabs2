@@ -14,6 +14,8 @@ public class MessageStore
     private readonly ConcurrentDictionary<string, Message> _pending = new();
     private readonly SemaphoreSlim _fileLock = new(1, 1);
     private readonly string _path;
+    private long _version;          // bumped on every change
+    private long _flushedVersion;   // highest version already on disk
 
     public MessageStore(IConfiguration cfg, ILogger<MessageStore> log)
     {
@@ -49,15 +51,29 @@ public class MessageStore
         if (_pending.TryRemove(id, out _)) await FlushAsync();
     }
 
+    // Group commit: callers queue on the lock; whoever gets it writes the file once for
+    // everything changed so far, and the callers behind it find their change already on disk.
     private async Task FlushAsync()
     {
+        var mine = Interlocked.Increment(ref _version);
         await _fileLock.WaitAsync();
         try
         {
+            if (Volatile.Read(ref _flushedVersion) >= mine) return;
+            var covered = Interlocked.Read(ref _version);
             var lines = _pending.Values.Select(m => Convert.ToBase64String(m.ToByteArray()));
             var tmp = _path + ".tmp";
             await File.WriteAllLinesAsync(tmp, lines);
-            File.Move(tmp, _path, true);
+            // On Windows the target can be briefly locked (antivirus/indexer): retry the atomic swap.
+            for (var attempt = 1; ; attempt++)
+            {
+                try { File.Move(tmp, _path, true); break; }
+                catch (Exception e) when (e is UnauthorizedAccessException or IOException && attempt < 8)
+                {
+                    await Task.Delay(25 * attempt);
+                }
+            }
+            Volatile.Write(ref _flushedVersion, covered);
         }
         finally { _fileLock.Release(); }
     }
